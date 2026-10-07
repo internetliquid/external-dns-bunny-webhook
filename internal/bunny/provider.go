@@ -35,18 +35,20 @@ type Options struct {
 }
 
 type Provider struct {
-	Options Options
-	client  Client
-	filter  endpoint.DomainFilterInterface
-	zoneMap *xsync.MapOf[string, int64]
+	Options      Options
+	client       Client
+	filter       endpoint.DomainFilterInterface
+	includeZones []string
+	zoneMap      *xsync.MapOf[string, int64]
 }
 
 func NewProvider(client Client, options Options) *Provider {
 	provider := &Provider{
-		Options: options,
-		client:  client,
-		filter:  getDomainFilter(options),
-		zoneMap: xsync.NewMapOf[string, int64](),
+		Options:      options,
+		client:       client,
+		filter:       getDomainFilter(options),
+		includeZones: normalizeZones(options.IncludeDomains),
+		zoneMap:      xsync.NewMapOf[string, int64](),
 	}
 
 	// On startup, fetch zones so that all available zones are cached. This
@@ -93,6 +95,11 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 
 	var endpoints []*endpoint.Endpoint
 	for _, zone := range zones {
+		// With an include list set, only its zones' records are returned.
+		if len(p.includeZones) > 0 && !lo.Contains(p.includeZones, normalizeName(zone.Domain)) {
+			continue
+		}
+
 		for _, record := range zone.Records {
 			// First check if the record type is supported, and if not
 			// skip the record altogether.
@@ -184,7 +191,14 @@ func (p *Provider) applyChangesDryRun(ctx context.Context, changes *plan.Changes
 	}
 
 	for _, ep := range changes.Create {
+		bunnyZoneID, _, domainName, err := p.getZoneID(ep.DNSName)
+		if err != nil {
+			return errs.Wrapf(err, "failed to create record %q", ep.DNSName)
+		}
+
 		slog.InfoContext(ctx, "DRY RUN: Create record",
+			slog.String("zone", domainName),
+			slog.Int64("zone_id", bunnyZoneID),
 			slog.Group("record",
 				slog.Any("name", ep.DNSName),
 				slog.Any("type", ep.RecordType),
@@ -252,10 +266,15 @@ func (p *Provider) applyChangesDryRun(ctx context.Context, changes *plan.Changes
 
 		var new *endpoint.Endpoint
 		for _, n := range changes.UpdateNew {
-			if n.DNSName == ep.DNSName && n.RecordType == ep.RecordType {
+			if identifierKey(n.DNSName, n.RecordType) == identifierKey(ep.DNSName, ep.RecordType) {
 				new = n
 				break
 			}
+		}
+
+		// The live path updates only records with a new endpoint, so skip as it does.
+		if new == nil {
+			continue
 		}
 
 		slog.InfoContext(ctx, "DRY RUN: Update record",
@@ -296,7 +315,20 @@ func (p *Provider) AdjustEndpoints(incoming []*endpoint.Endpoint) ([]*endpoint.E
 		return nil, errs.Wrapf(err, "failed to fetch records")
 	}
 
+	// The provider-specific properties a new record is created with. Records
+	// read back carry all of them, so an endpoint that lacks one would be
+	// updated on every pass.
+	defaults := &endpoint.Endpoint{}
+	opts, _ := providerSpecificOptionsFromEndpoint(defaults)
+	opts.ApplyToEndpoint(defaults)
+
 	for _, editing := range incoming {
+		for _, property := range defaults.ProviderSpecific {
+			if _, ok := editing.GetProviderSpecificProperty(property.Name); !ok {
+				editing.SetProviderSpecificProperty(property.Name, property.Value)
+			}
+		}
+
 		for _, checked := range fetched {
 			if editing.DNSName != checked.DNSName || editing.RecordType != checked.RecordType || editing.SetIdentifier != checked.SetIdentifier {
 				continue
@@ -316,25 +348,25 @@ func (p *Provider) GetDomainFilter() endpoint.DomainFilterInterface {
 	return p.filter
 }
 
-// getZoneID returns the zone ID for a given record name using the zone
-// map. If the zone ID is not found, an error is returned. The record name
-// is expected to be a fully qualified DNS name (record + domain. e.g. foo.example.com).
-func (p *Provider) getZoneID(dnsName string) (int64, error) {
+// getZoneID returns the zone ID, record name and zone for a fully qualified
+// DNS name (record + domain. e.g. foo.example.com) using the zone map. If no
+// zone can be found, an error is returned.
+func (p *Provider) getZoneID(dnsName string) (int64, string, string, error) {
 	errs := oops.In("Provider").
 		Span("getZoneID").
 		With("dnsName", dnsName)
 
-	_, domainName, ok := extractRecordComponents(p.allZones(), dnsName)
-	if !ok {
-		return 0, errs.Errorf("failed to extract components for %q", dnsName)
+	recordName, domainName, err := p.zoneFor(p.allZones(), dnsName)
+	if err != nil {
+		return 0, "", "", errs.Wrap(err)
 	}
 
 	zoneID, ok := p.zoneMap.Load(domainName)
 	if !ok {
-		return 0, errs.Errorf("zone ID for DNS name %q (%s) not found", dnsName, domainName)
+		return 0, "", "", errs.Errorf("zone ID for DNS name %q (%s) not found", dnsName, domainName)
 	}
 
-	return zoneID, nil
+	return zoneID, recordName, domainName, nil
 }
 
 // createEndpoints creates the given endpoints.
@@ -344,14 +376,9 @@ func (p *Provider) createEndpoints(ctx context.Context, creates []*endpoint.Endp
 		With("creates", len(creates))
 
 	for _, create := range creates {
-		bunnyZoneID, err := p.getZoneID(create.DNSName)
+		bunnyZoneID, recordName, domainName, err := p.getZoneID(create.DNSName)
 		if err != nil {
 			return errs.Wrapf(err, "failed to create record %q", create.DNSName)
-		}
-
-		recordName, domainName, ok := extractRecordComponents(p.allZones(), create.DNSName)
-		if !ok {
-			return errs.Errorf("failed to extract components for %q", create.DNSName)
 		}
 
 		opts, err := providerSpecificOptionsFromEndpoint(create)
@@ -500,8 +527,10 @@ type identifierTuple struct {
 	RecordID int64
 }
 
+// identifierKey ignores the name's case, so an update's old endpoint, spelled
+// as Bunny stores the record, pairs with its new endpoint.
 func identifierKey(dnsName string, recordType string) string {
-	return dnsName + "|" + recordType
+	return normalizeName(dnsName) + "|" + recordType
 }
 
 // fetchIdentifiers fetches the zone and record identifiers for the given endpoints by listing
@@ -525,9 +554,9 @@ func (p *Provider) fetchIdentifiers(ctx context.Context, endpoints []*endpoint.E
 	}
 
 	for _, ep := range endpoints {
-		recordName, domainName, ok := extractRecordComponents(domainNames, ep.DNSName)
-		if !ok {
-			return nil, fmt.Errorf("record %q cannot be handled, no matching zone found", ep.DNSName)
+		recordName, domainName, err := p.zoneFor(domainNames, ep.DNSName)
+		if err != nil {
+			return nil, err
 		}
 
 		for _, zone := range zones {
@@ -536,7 +565,7 @@ func (p *Provider) fetchIdentifiers(ctx context.Context, endpoints []*endpoint.E
 			}
 
 			for _, record := range zone.Records {
-				if record.Name != recordName || record.Type.String() != ep.RecordType {
+				if !strings.EqualFold(record.Name, recordName) || record.Type.String() != ep.RecordType {
 					continue
 				}
 
@@ -565,12 +594,7 @@ func (p *Provider) fetchZones(ctx context.Context) ([]*Zone, error) {
 			return nil, err
 		}
 
-		for _, zone := range results.Items {
-			// Cache the zone ID for lookup during creates.
-			p.cacheZone(zone)
-
-			zones = append(zones, zone)
-		}
+		zones = append(zones, results.Items...)
 
 		if !results.HasMoreItems {
 			break
@@ -579,21 +603,82 @@ func (p *Provider) fetchZones(ctx context.Context) ([]*Zone, error) {
 		page++
 	}
 
+	// Cache the zone IDs for lookup during creates. The listing replaces the
+	// cache, so a zone deleted from Bunny stops matching.
+	listed := make(map[string]bool, len(zones))
+	for _, zone := range zones {
+		p.cacheZone(zone)
+		listed[zone.Domain] = true
+	}
+
+	p.zoneMap.Range(func(domain string, _ int64) bool {
+		if !listed[domain] {
+			p.zoneMap.Delete(domain)
+		}
+		return true
+	})
+
 	return zones, nil
 }
 
-// extractRecordComponents extracts the record name and zone from a given DNS name
-// by matching the DNS name with the list of available zones. If a match cannot be
-// found, the function returns false as the third argument. When a match is found,
-// the function returns the record name, zone, and true as the third argument.
-func extractRecordComponents(zones []string, dnsName string) (string, string, bool) {
+// zoneFor splits a DNS name into its record name and zone. Candidates are the
+// include-list zones when the list has any, otherwise every zone in the
+// account. A candidate matches on whole labels and the longest match wins. The
+// record name is "" when the DNS name is the zone itself.
+func (p *Provider) zoneFor(zones []string, dnsName string) (string, string, error) {
+	name := normalizeName(dnsName)
+
+	account := make(map[string]string, len(zones))
 	for _, zone := range zones {
-		if strings.HasSuffix(dnsName, zone) {
-			return dnsName[:len(dnsName)-len(zone)-1], zone, true
+		account[normalizeName(zone)] = zone
+	}
+
+	candidates := p.includeZones
+	if len(candidates) == 0 {
+		candidates = lo.Keys(account)
+	}
+
+	best := ""
+	for _, candidate := range candidates {
+		if (name == candidate || strings.HasSuffix(name, "."+candidate)) && len(candidate) > len(best) {
+			best = candidate
 		}
 	}
 
-	return "", "", false
+	if best == "" {
+		if len(p.includeZones) > 0 {
+			return "", "", fmt.Errorf("no zone on BUNNY_INCLUDE_DOMAINS matches %q", dnsName)
+		}
+		return "", "", fmt.Errorf("no zone in the Bunny account matches %q", dnsName)
+	}
+
+	zone, ok := account[best]
+	if !ok {
+		return "", "", fmt.Errorf("zone %q is on BUNNY_INCLUDE_DOMAINS but missing from Bunny", best)
+	}
+
+	if name == best {
+		return "", zone, nil
+	}
+
+	return strings.TrimSuffix(name, "."+best), zone, nil
+}
+
+// normalizeName lower-cases a DNS name and drops its trailing dot.
+func normalizeName(name string) string {
+	return strings.ToLower(strings.TrimSuffix(name, "."))
+}
+
+// normalizeZones normalizes each zone and drops blank entries.
+func normalizeZones(zones []string) []string {
+	var normalized []string
+	for _, zone := range zones {
+		if zone = normalizeName(zone); zone != "" {
+			normalized = append(normalized, zone)
+		}
+	}
+
+	return normalized
 }
 
 func getDomainFilter(options Options) endpoint.DomainFilterInterface {

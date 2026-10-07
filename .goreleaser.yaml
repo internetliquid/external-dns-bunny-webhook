@@ -1,53 +1,73 @@
+# GoReleaser config — https://goreleaser.com
+# Releases are cut by release-please (it owns the version, changelog, tag, and
+# GitHub Release); GoReleaser builds the artifacts on the tag and appends them.
 version: 2
 
+before:
+  hooks:
+    - go mod tidy
+
 builds:
-  - main: ./cmd/webhook
+  - id: webhook
+    main: ./cmd/webhook
+    binary: external-dns-bunny-webhook
     env:
       - CGO_ENABLED=0
-    flags:
-      - -trimpath # removes all file system paths from the compiled executable
     goos:
       - linux
-      - darwin
     goarch:
       - amd64
-      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+# Build the container image with ko (no Dockerfile) on a distroless static
+# base, and push it to GHCR.
+kos:
+  - id: image
+    build: webhook
+    base_image: gcr.io/distroless/static-debian12:nonroot
+    repositories:
+      - ghcr.io/internetliquid/external-dns-bunny-webhook
+    platforms:
+      - linux/amd64
+    bare: true
+    preserve_import_paths: false
+    user: "65532:65532"
+    sbom: spdx
+    tags:
+      - "{{ .Tag }}"
+      - "{{ .Version }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    labels:
+      org.opencontainers.image.source: "https://github.com/internetliquid/external-dns-bunny-webhook"
+      org.opencontainers.image.description: "ExternalDNS webhook provider for Bunny.net DNS"
+      org.opencontainers.image.licenses: "MIT"
+
+archives:
+  - id: archive
+    ids:
+      - webhook
+    name_template: "{{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
 
 checksum:
-  name_template: "{{ .ProjectName }}_v{{ .Version }}_checksums.txt"
-  algorithm: sha256
+  name_template: "checksums.txt"
 
-snapshot:
-  name_template: "{{ .ProjectName }}_v{{ .Version }}"
+# The image's SBOM comes from ko (kos.sbom above). An archive-level sboms block
+# would need a syft binary on the runner.
 
+# release-please owns the changelog and release notes.
 changelog:
-  sort: asc
+  disable: true
 
-dockers:
-  - image_templates:
-      - "ghcr.io/contaimlabs/external-dns-bunny-webhook:{{ .Tag }}-amd64"
-    use: buildx
-    build_flag_templates:
-      - "--pull"
-      - "--platform=linux/amd64"
-  - image_templates:
-      - "ghcr.io/contaimlabs/external-dns-bunny-webhook:{{ .Tag }}-arm64"
-    use: buildx
-    build_flag_templates:
-      - "--pull"
-      - "--platform=linux/arm64"
-    goarch: arm64
-
-docker_manifests:
-  - name_template: "ghcr.io/contaimlabs/external-dns-bunny-webhook:latest"
-    image_templates:
-      - "ghcr.io/contaimlabs/external-dns-bunny-webhook:{{ .Tag }}-amd64"
-      - "ghcr.io/contaimlabs/external-dns-bunny-webhook:{{ .Tag }}-arm64"
-  - name_template: "ghcr.io/contaimlabs/external-dns-bunny-webhook:{{ .Tag }}"
-    image_templates:
-      - "ghcr.io/contaimlabs/external-dns-bunny-webhook:{{ .Tag }}-amd64"
-      - "ghcr.io/contaimlabs/external-dns-bunny-webhook:{{ .Tag }}-arm64"
 release:
   github:
-    owner: contaimlabs
+    owner: internetliquid
     name: external-dns-bunny-webhook
+  # release-please has already created the GitHub Release; add the binaries
+  # and checksums to it rather than recreating it.
+  mode: append
