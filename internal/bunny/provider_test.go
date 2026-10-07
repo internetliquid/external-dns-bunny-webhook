@@ -55,6 +55,11 @@ func (c *fakeClient) CreateRecord(_ context.Context, zoneID string, r CreateReco
 		Disabled:    r.Disabled,
 	}
 
+	// Bunny keeps a weight only on A and AAAA records and stores 0 on the rest.
+	if r.Type != RecordTypeA && r.Type != RecordTypeAAAA {
+		record.Weight = 0
+	}
+
 	for _, zone := range c.zones {
 		if strconv.FormatInt(zone.ID, 10) == zoneID {
 			zone.Records = append(zone.Records, record)
@@ -561,20 +566,23 @@ func TestApexRecordReadBackUnchanged(t *testing.T) {
 func TestAdjustEndpointsMatchesRecordAsCreated(t *testing.T) {
 	tests := []struct {
 		name        string
+		recordType  string
 		created     map[string]string // properties of the endpoint the record was created from
 		desired     map[string]string
 		wantUpdates int
 	}{
-		{name: "no properties set"},
-		{name: "weight above range", created: map[string]string{providerSpecificWeight: "150"}, desired: map[string]string{providerSpecificWeight: "150"}},
-		{name: "weight below range", created: map[string]string{providerSpecificWeight: "0"}, desired: map[string]string{providerSpecificWeight: "0"}},
-		{name: "weight not a number", created: map[string]string{providerSpecificWeight: "abc"}, desired: map[string]string{providerSpecificWeight: "abc"}},
-		{name: "disabled not a bool", created: map[string]string{providerSpecificDisabled: "yes"}, desired: map[string]string{providerSpecificDisabled: "yes"}},
-		{name: "explicit weight that differs", desired: map[string]string{providerSpecificWeight: "50"}, wantUpdates: 1},
+		{name: "no properties set", recordType: endpoint.RecordTypeA},
+		{name: "CNAME, which Bunny stores without a weight", recordType: endpoint.RecordTypeCNAME},
+		{name: "weight above range", recordType: endpoint.RecordTypeA, created: map[string]string{providerSpecificWeight: "150"}, desired: map[string]string{providerSpecificWeight: "150"}},
+		{name: "weight below range", recordType: endpoint.RecordTypeA, created: map[string]string{providerSpecificWeight: "0"}, desired: map[string]string{providerSpecificWeight: "0"}},
+		{name: "weight not a number", recordType: endpoint.RecordTypeA, created: map[string]string{providerSpecificWeight: "abc"}, desired: map[string]string{providerSpecificWeight: "abc"}},
+		{name: "disabled not a bool", recordType: endpoint.RecordTypeA, created: map[string]string{providerSpecificDisabled: "yes"}, desired: map[string]string{providerSpecificDisabled: "yes"}},
+		{name: "explicit weight that differs", recordType: endpoint.RecordTypeA, desired: map[string]string{providerSpecificWeight: "50"}, wantUpdates: 1},
 	}
 
-	newEndpoint := func(properties map[string]string) *endpoint.Endpoint {
-		ep := endpoint.NewEndpoint("joe."+testZone, endpoint.RecordTypeA, "192.0.2.1")
+	targets := map[string]string{endpoint.RecordTypeA: "192.0.2.1", endpoint.RecordTypeCNAME: "target.example.net"}
+	newEndpoint := func(recordType string, properties map[string]string) *endpoint.Endpoint {
+		ep := endpoint.NewEndpoint("joe."+testZone, recordType, targets[recordType])
 		for name, value := range properties {
 			ep.WithProviderSpecific(name, value)
 		}
@@ -587,11 +595,11 @@ func TestAdjustEndpointsMatchesRecordAsCreated(t *testing.T) {
 			client := &fakeClient{zones: zonesNamed(testZone)}
 			p := NewProvider(client, Options{IncludeDomains: []string{testZone}})
 
-			if err := p.ApplyChanges(context.Background(), &plan.Changes{Create: []*endpoint.Endpoint{newEndpoint(tt.created)}}); err != nil {
+			if err := p.ApplyChanges(context.Background(), &plan.Changes{Create: []*endpoint.Endpoint{newEndpoint(tt.recordType, tt.created)}}); err != nil {
 				t.Fatalf("create: %v", err)
 			}
 
-			adjusted, err := p.AdjustEndpoints([]*endpoint.Endpoint{newEndpoint(tt.desired)})
+			adjusted, err := p.AdjustEndpoints([]*endpoint.Endpoint{newEndpoint(tt.recordType, tt.desired)})
 			if err != nil {
 				t.Fatalf("AdjustEndpoints: %v", err)
 			}
@@ -604,7 +612,7 @@ func TestAdjustEndpointsMatchesRecordAsCreated(t *testing.T) {
 			changes := (&plan.Plan{
 				Current:        current,
 				Desired:        adjusted,
-				ManagedRecords: []string{endpoint.RecordTypeA},
+				ManagedRecords: []string{tt.recordType},
 			}).Calculate().Changes
 			if len(changes.Create) != 0 || len(changes.Delete) != 0 || len(changes.UpdateNew) != tt.wantUpdates {
 				t.Errorf("changes = %+v, want %d updates and nothing else", changes, tt.wantUpdates)

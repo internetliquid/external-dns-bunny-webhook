@@ -269,9 +269,13 @@ func (p *Provider) AdjustEndpoints(incoming []*endpoint.Endpoint) ([]*endpoint.E
 	}
 
 	for _, editing := range incoming {
-		// Give the endpoint the provider-specific values a create would send,
-		// defaulted and clamped, so it compares equal to the record read back.
+		// Give the endpoint the provider-specific values Bunny reads back for a
+		// create, defaulted and clamped, so it compares equal to the record.
+		// Bunny keeps a weight only on A and AAAA records and stores 0 on the rest.
 		opts, _ := providerSpecificOptionsFromEndpoint(editing)
+		if editing.RecordType != endpoint.RecordTypeA && editing.RecordType != endpoint.RecordTypeAAAA {
+			opts.Weight = 0
+		}
 		opts.ApplyToEndpoint(editing)
 
 		for _, checked := range fetched {
@@ -442,10 +446,7 @@ func (p *Provider) createEndpoints(ctx context.Context, creates []resolvedCreate
 // updateEndpoints updates the given endpoints.
 func (p *Provider) updateEndpoints(ctx context.Context, identifiers map[string]identifierTuple, updates []*endpoint.Endpoint) error {
 	for _, update := range updates {
-		tuple, ok := identifiers[identifierKey(update.DNSName, update.RecordType)]
-		if !ok {
-			return fmt.Errorf("failed to get record identifiers for %q", update.DNSName)
-		}
+		tuple := identifiers[identifierKey(update.DNSName, update.RecordType)]
 
 		opts, err := providerSpecificOptionsFromEndpoint(update)
 		if err != nil {
@@ -483,10 +484,7 @@ func (p *Provider) updateEndpoints(ctx context.Context, identifiers map[string]i
 
 func (p *Provider) deleteEndpoints(ctx context.Context, identifiers map[string]identifierTuple, deletions []*endpoint.Endpoint) error {
 	for _, deletion := range deletions {
-		tuple, ok := identifiers[identifierKey(deletion.DNSName, deletion.RecordType)]
-		if !ok {
-			return fmt.Errorf("failed to get record identifiers for %q", deletion.DNSName)
-		}
+		tuple := identifiers[identifierKey(deletion.DNSName, deletion.RecordType)]
 
 		opts, err := providerSpecificOptionsFromEndpoint(deletion)
 		if err != nil {

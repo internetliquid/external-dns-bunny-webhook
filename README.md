@@ -37,9 +37,10 @@ webhook may write to. Create, update and delete all choose a zone the same way:
 spaces and entries that are just `.`), the webhook exits at start with an error instead of writing
 to every zone. Leaving it unset keeps upstream's every-zone behaviour.
 
-**Upstream.** The zone matching, the apex read-back and `AdjustEndpoints` filling in Bunny's record
-defaults are offered back to upstream; the start refusal and the release pipeline are ours alone.
-The settings keep upstream's names, so moving back to upstream's image is an image change only.
+**Upstream.** The zone matching, the apex read-back and `AdjustEndpoints` setting all three Bunny
+settings to what a create sends and Bunny stores (defaults filled, weight clamped to 1–100 on A and
+AAAA and 0 on other types, unreadable values defaulted) go upstream; the start refusal and release
+pipeline stay ours. Settings keep upstream's names, so moving back is an image change only.
 
 ## Important
 
