@@ -1,0 +1,108 @@
+name: Claude merge review
+
+# One review per pull request, not one per push. It runs when the PR is opened
+# ready for review or moves out of draft, and again only when someone adds the
+# `re-review` label. Fix rounds are reviewed locally first (/babysit-pr), so a
+# push to the PR never starts a paid review on its own.
+#
+# It lives in its own file so that adding the label runs only this job. In the
+# same file as the required checks, a label event would re-run those checks and
+# could replace a failed result with a skipped one.
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, labeled]
+    branches: [develop, main]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Pre-merge review by Claude. Skipped for bot-authored PRs (e.g. release-please's
+  # release PRs), for PRs from forks (they get no secrets), and for PRs whose title
+  # carries [skip-review] or [WIP].
+  review:
+    name: Claude code review
+    if: >-
+      github.event.pull_request.draft == false &&
+      (github.event.action != 'labeled' || github.event.label.name == 're-review') &&
+      github.event.pull_request.user.type != 'Bot' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !contains(github.event.pull_request.title, '[skip-review]') &&
+      !contains(github.event.pull_request.title, '[WIP]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # write: the label-clearing step below removes `re-review`.
+      pull-requests: write
+      issues: read
+      id-token: write
+      # lets the reviewer read this PR's workflow runs
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, so `git diff origin/<base>...HEAD` finds where the PR branched off.
+          fetch-depth: 0
+
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@58985842b834ed26087302ba27d07bc24ca8697a # v1.0.244
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          use_sticky_comment: true
+          # Without `track_progress` the review posts no comment.
+          track_progress: true
+          # Public repo: anyone can comment, and comments reach the prompt, so the reviewer
+          # gets no tool that edits or commits.
+          claude_args: |
+            --model opus
+            --disallowedTools "Agent,Edit,MultiEdit,Write,NotebookEdit,Bash(git add:*),Bash(git commit:*),Bash(git rm:*)"
+          prompt: |
+            ROLE: Senior Go engineer, pre-merge review of an ExternalDNS webhook provider for Bunny.net DNS. This repo is ILQ's fork of the upstream Bunny webhook (MIT); the Go module path stays upstream's on purpose. ILQ's changes over upstream: whole-label zone matching (longest zone wins, include-list zones only, an error rather than a skip when no zone fits or a listed zone is missing from Bunny), apex records read back under the zone's name, Records returning only include-list zones when the list is set, Bunny's three record defaults filled in AdjustEndpoints so read-back records do not churn, refusing to start when BUNNY_INCLUDE_DOMAINS is set but lists no zone, and the release pipeline (release-please + GoReleaser/ko, linux/amd64, distroless/nonroot, GHCR). Stack: Go per go.mod; external-dns `provider/webhook/api` server; a typed JSON Bunny client over net/http; envconfig; suture; slog. Branch model develop+main.
+
+            STANCE:
+            - Be skeptical but realistic. Most code is fine. Silence is approval.
+            - No praise, no "looks good," no thank-you, no closing remarks.
+            - Cite `path:LINE` for every finding. No vague advice.
+            - Severity (anchor honestly — most real findings are MINOR):
+              - BLOCKER — concrete bug, security gap, or invariant violation that should not merge. Rare.
+              - MAJOR — concrete bug or choice that will cause real problems soon. Uncommon.
+              - MINOR — real issue with bounded blast radius. Default tag for real findings.
+              - NIT — preference the compiler doesn't catch. Use sparingly.
+            - Skip categories with no real finding. Do not invent issues to fill slots.
+            - Earlier reviews reach you only through the author's replies on this PR, so treat every finding answered there as settled.
+            - Every run reviews the whole PR, not just the latest commit: get it with `git diff origin/${{ github.base_ref }}...HEAD`, run as a command of its own (the base branch is already fetched; `git fetch` is not available).
+            - gofmt/go vet/golangci-lint/govulncheck already ran and passed — don't spend budget on style or on vulns they'd catch.
+
+            CHECK:
+            1. Invariants — the API key is a secret: never logged or put in an error; every outbound call carries the request context; create, update and delete pick a zone through the one matcher (whole labels, longest match, include list only when set, every zone when unset); a name that fits no zone, or an include-list zone missing from Bunny, returns an error and writes nothing; an apex record is "" on the Bunny side and the zone name on the external-dns side, so it does not churn, but external-dns files an apex name's ownership TXT outside the zone (a-<zone>), where it is refused unless a parent zone is a candidate, so apex routes are not supported; each A/AAAA update or delete uses that record's own ID; the zone cache is replaced by each listing and adds no Bunny API calls per pass; Records returns only include-list zones when a list is set; AdjustEndpoints fills each of Bunny's three record defaults an endpoint lacks, with the values a create sends; the start refusal applies only when BUNNY_INCLUDE_DOMAINS is present and names no zone once entries are trimmed and a trailing dot is dropped; upstream's setting names are unchanged (switching back to upstream's image must stay an image change only); the webhook contract methods stay conformant (Records / ApplyChanges / AdjustEndpoints / GetDomainFilter).
+            2. Upstream-bound files — `internal/bunny/provider.go`, `provider_mapper.go` and `provider_test.go` are copied onto upstream's branch and must build and pass under Go 1.23: no language or standard-library features newer than Go 1.23 in them, and nothing ILQ-only (the start refusal, pipeline) in them.
+            3. Go correctness in this diff — errors wrapped with %w and never swallowed; no data races (shared maps/fields touched across goroutines — zone cache, health state); context cancellation honoured; every resp.Body closed; no goroutine leaks; output never depends on map-iteration order.
+            4. Release pipeline in this diff — actions pinned by full commit SHA with a version comment; workflow tokens least-privilege; images go to ghcr.io/internetliquid only, never upstream's registry; release-please and GoReleaser stay in one job.
+            5. Tests — table tests with a fake Client cover the changed branches (look-alike zone, parent/child zones, apex, no zone, missing zone, case and trailing dot, A+AAAA record IDs); race-sensitive code is exercised under -race.
+
+            OUTPUT:
+
+            **Verdict:** BLOCK / RISKY / OK
+
+            **Findings:** (omit heading if none)
+            - `[SEVERITY] path:LINE` — problem · why · fix.
+
+            No strengths section, TL;DR, thank-you, or closing.
+
+      # Adding `re-review` is how a person asks for another review. Clear it so the
+      # next request can add it again — re-adding a label that is already on the PR
+      # fires no event.
+      - name: Clear the re-review label
+        if: always() && github.event.action == 'labeled'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh api -X DELETE "repos/${REPO}/issues/${PR}/labels/re-review" >/dev/null \
+            || echo "::warning::could not remove the re-review label — remove it by hand before asking again"
