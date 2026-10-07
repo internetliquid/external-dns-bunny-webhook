@@ -38,7 +38,7 @@ spaces and entries that are just `.`), the webhook exits at start with an error 
 to every zone. Leaving it unset keeps upstream's every-zone behaviour.
 
 **Upstream.** The zone matching, the apex read-back and `AdjustEndpoints` setting all three Bunny
-settings to what a create sends and Bunny stores (defaults filled, weight clamped to 1–100 on A and
+settings to what Bunny stores for a create (defaults filled, weight clamped to 1–100 on A and
 AAAA and 0 on other types, unreadable values defaulted) go upstream; the start refusal and release
 pipeline stay ours. Settings keep upstream's names, so moving back is an image change only.
 
