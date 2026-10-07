@@ -1,8 +1,6 @@
 module github.com/contaimlabs/external-dns-bunny-webhook
 
-go 1.23.3
-
-toolchain go1.23.4
+go 1.27.1
 
 require (
 	github.com/hashicorp/go-cleanhttp v0.5.2

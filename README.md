@@ -7,6 +7,41 @@ DNS records to an external DNS provider such as this one.
 
 This repository contains a provider that implements an ExternalDNS webhook provider for [Bunny.net](https://bunny.net).
 
+## This fork
+
+This is Internet Liquid's fork of
+[contaimlabs/external-dns-bunny-webhook](https://github.com/contaimlabs/external-dns-bunny-webhook).
+
+**Image:** `ghcr.io/internetliquid/external-dns-bunny-webhook`, public, `linux/amd64` only. Our
+versions start at `v0.100.0`, so none of them can be mistaken for an upstream release (upstream's
+last is `v0.3.1`, published under `ghcr.io/contaimlabs`). Each release is built from `develop` by
+release-please and GoReleaser, and `main` is moved to it.
+
+**How a record finds its zone.** `BUNNY_INCLUDE_DOMAINS` is a comma-separated list of the zones the
+webhook may write to. Create, update and delete all choose a zone the same way:
+
+- A name belongs to a zone only if it is the zone itself or ends with a dot followed by the zone, so
+  `joe.apps.98dollarwebsite.com` never lands in a zone called `website.com`.
+- If more than one zone fits, the longest one wins: `apps.98dollarwebsite.com` beats
+  `98dollarwebsite.com`.
+- Only zones on the list are considered. With the list unset, every zone in the Bunny account is.
+- Upper case and a trailing dot make no difference.
+- If no zone fits, or a listed zone is not in the Bunny account, the whole pass fails with an error
+  naming it and nothing in that pass is written; external-dns tries again on its next pass.
+- A record for the zone's own name (the apex) is stored in Bunny with an empty name and read back
+  under the zone's name without churn, but apex routes are not supported: external-dns files the
+  apex's ownership record outside the zone (`a-apps.98dollarwebsite.com` for
+  `apps.98dollarwebsite.com`), where it is refused unless a parent zone is a candidate.
+
+**Refusing to start.** If `BUNNY_INCLUDE_DOMAINS` is set but names no zone (empty, or only commas,
+spaces and entries that are just `.`), the webhook exits at start with an error instead of writing
+to every zone. Leaving it unset keeps upstream's every-zone behaviour.
+
+**Upstream.** The zone matching, the apex read-back and `AdjustEndpoints` setting all three Bunny
+settings to what a create sends and Bunny stores (defaults filled, weight clamped to 1–100 on A and
+AAAA and 0 on other types, unreadable values defaulted) go upstream; the start refusal and release
+pipeline stay ours. Settings keep upstream's names, so moving back is an image change only.
+
 ## Important
 
 This provider is not officially supported by [Bunny.net](https://bunny.net), but is maintained by the team at Contaim Labs
@@ -32,8 +67,8 @@ provider:
   name: webhook
   webhook:
     image:
-      repository: ghcr.io/contaimlabs/external-dns-bunny-webhook
-      tag: v0.3.0
+      repository: ghcr.io/internetliquid/external-dns-bunny-webhook
+      tag: v0.100.0
     env:
       - name: BUNNY_API_KEY
         valueFrom:
@@ -64,6 +99,7 @@ The provider can be configured using the following environment variables:
 | Environment Variable | Required | Description | Default |
 |----------------------|----------|-------------|---------|
 | `BUNNY_API_KEY` | Yes | The API key used to authenticate with the Bunny.net API. | |
+| `BUNNY_INCLUDE_DOMAINS` | No | Comma-separated zones the webhook may write to; see [How a record finds its zone](#this-fork). | every zone |
 | `BUNNY_DRY_RUN` | No | If set to `true`, the provider will not make any changes to the DNS records. | `false` |
 | `WEBHOOK_HOST` | No | The host to use for the webhook endpoint. | `localhost` |
 | `WEBHOOK_PORT` | No | The port to use for the webhook endpoint. | `8888` |

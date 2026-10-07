@@ -26,3 +26,10 @@ go.work.sum
 
 # Local scratch space for tests
 .local
+
+# GoReleaser output
+/dist/
+
+# Agent memory stays on the machine that wrote it
+.claude/agent-memory/
+.remember/
