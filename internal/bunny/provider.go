@@ -133,30 +133,20 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 		return p.applyChangesDryRun(ctx, changes)
 	}
 
-	err := p.createEndpoints(ctx, changes.Create)
+	creates, tuples, err := p.resolveChanges(ctx, changes)
+	if err != nil {
+		slog.Error("Failed to resolve changes",
+			slog.Any("error", err))
+
+		return errs.Wrapf(err, "failed to resolve changes")
+	}
+
+	err = p.createEndpoints(ctx, creates)
 	if err != nil {
 		slog.Error("Failed to create endpoints",
 			slog.Any("error", err))
 
 		return errs.Wrapf(err, "failed to apply creates")
-	}
-
-	// If we have no deletions or updates, we can return early to avoid making a (potentially)
-	// expensive call to the Bunny.net API.
-	if len(changes.Delete) == 0 && len(changes.UpdateOld) == 0 {
-		return nil
-	}
-
-	var lookupEndpoints []*endpoint.Endpoint
-	lookupEndpoints = append(lookupEndpoints, changes.Delete...)
-	lookupEndpoints = append(lookupEndpoints, changes.UpdateOld...)
-
-	tuples, err := p.fetchIdentifiers(ctx, lookupEndpoints)
-	if err != nil {
-		slog.Error("Failed to fetch identifiers",
-			slog.Any("error", err))
-
-		return errs.Wrapf(err, "failed to fetch identifiers")
 	}
 
 	err = p.deleteEndpoints(ctx, tuples, changes.Delete)
@@ -190,54 +180,28 @@ func (p *Provider) applyChangesDryRun(ctx context.Context, changes *plan.Changes
 		return nil
 	}
 
-	for _, ep := range changes.Create {
-		bunnyZoneID, _, domainName, err := p.getZoneID(ep.DNSName)
-		if err != nil {
-			return errs.Wrapf(err, "failed to create record %q", ep.DNSName)
-		}
+	creates, tuples, err := p.resolveChanges(ctx, changes)
+	if err != nil {
+		slog.Error("Failed to resolve changes",
+			slog.Any("error", err))
 
+		return errs.Wrapf(err, "failed to resolve changes")
+	}
+
+	for _, create := range creates {
 		slog.InfoContext(ctx, "DRY RUN: Create record",
-			slog.String("zone", domainName),
-			slog.Int64("zone_id", bunnyZoneID),
+			slog.String("zone", create.zone),
+			slog.Int64("zone_id", create.zoneID),
 			slog.Group("record",
-				slog.Any("name", ep.DNSName),
-				slog.Any("type", ep.RecordType),
-				slog.Any("value", ep.Targets),
-				slog.Any("ttl", ep.RecordTTL),
+				slog.Any("name", create.endpoint.DNSName),
+				slog.Any("type", create.endpoint.RecordType),
+				slog.Any("value", create.endpoint.Targets),
+				slog.Any("ttl", create.endpoint.RecordTTL),
 			))
 	}
 
-	// If we have no deletions or updates, we can return early to avoid making a (potentially)
-	// expensive call to the Bunny.net API.
-	if len(changes.Delete) == 0 && len(changes.UpdateOld) == 0 {
-		return nil
-	}
-
-	var lookupEndpoints []*endpoint.Endpoint
-	lookupEndpoints = append(lookupEndpoints, changes.Delete...)
-	lookupEndpoints = append(lookupEndpoints, changes.UpdateOld...)
-
-	tuples, err := p.fetchIdentifiers(ctx, lookupEndpoints)
-	if err != nil {
-		slog.Error("Failed to fetch identifiers",
-			slog.Any("error", err))
-
-		return errs.Wrapf(err, "failed to fetch identifiers")
-	}
-
 	for _, ep := range changes.Delete {
-		tuple, ok := tuples[identifierKey(ep.DNSName, ep.RecordType)]
-		if !ok {
-			slog.InfoContext(ctx, "DRY RUN: Delete record (would skip, not found in Bunny API)",
-				slog.Group("record",
-					slog.String("name", ep.DNSName),
-					slog.String("type", ep.RecordType),
-					slog.String("value", lo.FirstOr(ep.Targets, "")),
-					slog.Int("ttl", int(ep.RecordTTL)),
-				))
-
-			continue
-		}
+		tuple := tuples[identifierKey(ep.DNSName, ep.RecordType)]
 
 		slog.InfoContext(ctx, "DRY RUN: Delete record",
 			slog.Int64("zone_id", tuple.ZoneID),
@@ -251,19 +215,6 @@ func (p *Provider) applyChangesDryRun(ctx context.Context, changes *plan.Changes
 	}
 
 	for _, ep := range changes.UpdateOld {
-		tuple, ok := tuples[identifierKey(ep.DNSName, ep.RecordType)]
-		if !ok {
-			slog.InfoContext(ctx, "DRY RUN: Update record (would skip, not found in Bunny API)",
-				slog.Group("current",
-					slog.String("name", ep.DNSName),
-					slog.String("type", ep.RecordType),
-					slog.String("value", lo.FirstOr(ep.Targets, "")),
-					slog.Int("ttl", int(ep.RecordTTL)),
-				))
-
-			continue
-		}
-
 		var new *endpoint.Endpoint
 		for _, n := range changes.UpdateNew {
 			if identifierKey(n.DNSName, n.RecordType) == identifierKey(ep.DNSName, ep.RecordType) {
@@ -276,6 +227,8 @@ func (p *Provider) applyChangesDryRun(ctx context.Context, changes *plan.Changes
 		if new == nil {
 			continue
 		}
+
+		tuple := tuples[identifierKey(ep.DNSName, ep.RecordType)]
 
 		slog.InfoContext(ctx, "DRY RUN: Update record",
 			slog.Int64("zone_id", tuple.ZoneID),
@@ -315,19 +268,11 @@ func (p *Provider) AdjustEndpoints(incoming []*endpoint.Endpoint) ([]*endpoint.E
 		return nil, errs.Wrapf(err, "failed to fetch records")
 	}
 
-	// The provider-specific properties a new record is created with. Records
-	// read back carry all of them, so an endpoint that lacks one would be
-	// updated on every pass.
-	defaults := &endpoint.Endpoint{}
-	opts, _ := providerSpecificOptionsFromEndpoint(defaults)
-	opts.ApplyToEndpoint(defaults)
-
 	for _, editing := range incoming {
-		for _, property := range defaults.ProviderSpecific {
-			if _, ok := editing.GetProviderSpecificProperty(property.Name); !ok {
-				editing.SetProviderSpecificProperty(property.Name, property.Value)
-			}
-		}
+		// Give the endpoint the provider-specific values a create would send,
+		// defaulted and clamped, so it compares equal to the record read back.
+		opts, _ := providerSpecificOptionsFromEndpoint(editing)
+		opts.ApplyToEndpoint(editing)
 
 		for _, checked := range fetched {
 			if editing.DNSName != checked.DNSName || editing.RecordType != checked.RecordType || editing.SetIdentifier != checked.SetIdentifier {
@@ -369,17 +314,66 @@ func (p *Provider) getZoneID(dnsName string) (int64, string, string, error) {
 	return zoneID, recordName, domainName, nil
 }
 
+type resolvedCreate struct {
+	endpoint   *endpoint.Endpoint
+	zoneID     int64
+	recordName string
+	zone       string
+}
+
+// resolveChanges resolves the zone of every create and the record identifiers
+// of every delete and update before anything is written, so a pass that
+// refuses any name writes nothing. Creates read the zone cache; deletes and
+// updates share one zone listing.
+func (p *Provider) resolveChanges(ctx context.Context, changes *plan.Changes) ([]resolvedCreate, map[string]identifierTuple, error) {
+	errs := oops.In("Provider").
+		Span("resolveChanges")
+
+	var creates []resolvedCreate
+	for _, create := range changes.Create {
+		zoneID, recordName, zone, err := p.getZoneID(create.DNSName)
+		if err != nil {
+			return nil, nil, errs.Wrapf(err, "failed to create record %q", create.DNSName)
+		}
+
+		creates = append(creates, resolvedCreate{endpoint: create, zoneID: zoneID, recordName: recordName, zone: zone})
+	}
+
+	// If we have no deletions or updates, we can return early to avoid making a (potentially)
+	// expensive call to the Bunny.net API.
+	if len(changes.Delete) == 0 && len(changes.UpdateOld) == 0 {
+		return creates, nil, nil
+	}
+
+	var lookupEndpoints []*endpoint.Endpoint
+	lookupEndpoints = append(lookupEndpoints, changes.Delete...)
+	lookupEndpoints = append(lookupEndpoints, changes.UpdateOld...)
+
+	tuples, err := p.fetchIdentifiers(ctx, lookupEndpoints)
+	if err != nil {
+		return nil, nil, errs.Wrapf(err, "failed to fetch identifiers")
+	}
+
+	// Deletes and updates look these keys up as they write.
+	for _, endpoints := range [][]*endpoint.Endpoint{changes.Delete, changes.UpdateNew} {
+		for _, ep := range endpoints {
+			if _, ok := tuples[identifierKey(ep.DNSName, ep.RecordType)]; !ok {
+				return nil, nil, errs.Errorf("failed to get record identifiers for %q", ep.DNSName)
+			}
+		}
+	}
+
+	return creates, tuples, nil
+}
+
 // createEndpoints creates the given endpoints.
-func (p *Provider) createEndpoints(ctx context.Context, creates []*endpoint.Endpoint) error {
+func (p *Provider) createEndpoints(ctx context.Context, creates []resolvedCreate) error {
 	errs := oops.In("Provider").
 		Span("createEndpoints").
 		With("creates", len(creates))
 
-	for _, create := range creates {
-		bunnyZoneID, recordName, domainName, err := p.getZoneID(create.DNSName)
-		if err != nil {
-			return errs.Wrapf(err, "failed to create record %q", create.DNSName)
-		}
+	for _, resolved := range creates {
+		create, bunnyZoneID, recordName, domainName := resolved.endpoint, resolved.zoneID, resolved.recordName, resolved.zone
 
 		opts, err := providerSpecificOptionsFromEndpoint(create)
 		if err != nil {

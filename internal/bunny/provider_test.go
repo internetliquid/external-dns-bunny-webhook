@@ -3,6 +3,7 @@ package bunny
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"strconv"
@@ -252,6 +253,68 @@ func TestApplyChangesRefusesUnmatchedName(t *testing.T) {
 	}
 }
 
+func TestRefusedNameWritesNothing(t *testing.T) {
+	a := func(dnsName string) *endpoint.Endpoint {
+		return endpoint.NewEndpoint(dnsName, endpoint.RecordTypeA, "192.0.2.1")
+	}
+
+	tests := []struct {
+		name    string
+		changes plan.Changes
+		wantErr string
+	}{
+		{
+			name:    "valid create then a name under no included zone",
+			changes: plan.Changes{Create: []*endpoint.Endpoint{a("new." + testZone), a("joe.ample.com")}},
+			wantErr: `no zone on BUNNY_INCLUDE_DOMAINS matches "joe.ample.com"`,
+		},
+		{
+			name:    "valid create plus a delete under no included zone",
+			changes: plan.Changes{Create: []*endpoint.Endpoint{a("new." + testZone)}, Delete: []*endpoint.Endpoint{a("joe.ample.com")}},
+			wantErr: `no zone on BUNNY_INCLUDE_DOMAINS matches "joe.ample.com"`,
+		},
+		{
+			name:    "valid create plus a delete of a record Bunny lacks",
+			changes: plan.Changes{Create: []*endpoint.Endpoint{a("new." + testZone)}, Delete: []*endpoint.Endpoint{a("gone." + testZone)}},
+			wantErr: `failed to get record identifiers for "gone.apps.example.com"`,
+		},
+		{
+			name: "valid delete plus an update of a record Bunny lacks",
+			changes: plan.Changes{
+				Delete:    []*endpoint.Endpoint{a("joe." + testZone)},
+				UpdateOld: []*endpoint.Endpoint{a("gone." + testZone)},
+				UpdateNew: []*endpoint.Endpoint{a("gone." + testZone)},
+			},
+			wantErr: `failed to get record identifiers for "gone.apps.example.com"`,
+		},
+	}
+
+	for _, tt := range tests {
+		for _, dryRun := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, dry run %v", tt.name, dryRun), func(t *testing.T) {
+				client := &fakeClient{zones: []*Zone{
+					{ID: 1, Domain: "ample.com"},
+					{ID: 2, Domain: testZone, Records: []*Record{{ID: 11, Type: RecordTypeA, Name: "joe", Value: "192.0.2.1"}}},
+				}}
+				p := NewProvider(client, Options{IncludeDomains: []string{testZone}, DryRun: dryRun})
+				logs := captureLogs(t)
+
+				changes := tt.changes
+				err := p.ApplyChanges(context.Background(), &changes)
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tt.wantErr)
+				}
+				if len(client.creates)+len(client.deletes)+len(client.updates) != 0 {
+					t.Errorf("creates = %+v, deletes = %+v, updates = %+v, want none", client.creates, client.deletes, client.updates)
+				}
+				if strings.Contains(logs.String(), "DRY RUN:") {
+					t.Errorf("log = %q, want no dry-run change logged", logs.String())
+				}
+			})
+		}
+	}
+}
+
 func TestApplyChangesUsesEachRecordsOwnID(t *testing.T) {
 	newClient := func() *fakeClient {
 		return &fakeClient{zones: []*Zone{{
@@ -496,32 +559,39 @@ func TestApexRecordReadBackUnchanged(t *testing.T) {
 }
 
 func TestAdjustEndpointsMatchesRecordAsCreated(t *testing.T) {
-	// Bunny holds the record as createEndpoints writes it for an endpoint with
-	// no provider-specific properties.
-	client := &fakeClient{zones: []*Zone{{
-		ID:      7,
-		Domain:  testZone,
-		Records: []*Record{{ID: 11, Type: RecordTypeA, Name: "joe", Value: "192.0.2.1", TTLSeconds: 300, Weight: 100}},
-	}}}
-	p := NewProvider(client, Options{IncludeDomains: []string{testZone}})
-
 	tests := []struct {
 		name        string
-		weight      string
+		created     map[string]string // properties of the endpoint the record was created from
+		desired     map[string]string
 		wantUpdates int
 	}{
-		{name: "no properties set", wantUpdates: 0},
-		{name: "explicit weight that differs", weight: "50", wantUpdates: 1},
+		{name: "no properties set"},
+		{name: "weight above range", created: map[string]string{providerSpecificWeight: "150"}, desired: map[string]string{providerSpecificWeight: "150"}},
+		{name: "weight below range", created: map[string]string{providerSpecificWeight: "0"}, desired: map[string]string{providerSpecificWeight: "0"}},
+		{name: "weight not a number", created: map[string]string{providerSpecificWeight: "abc"}, desired: map[string]string{providerSpecificWeight: "abc"}},
+		{name: "disabled not a bool", created: map[string]string{providerSpecificDisabled: "yes"}, desired: map[string]string{providerSpecificDisabled: "yes"}},
+		{name: "explicit weight that differs", desired: map[string]string{providerSpecificWeight: "50"}, wantUpdates: 1},
+	}
+
+	newEndpoint := func(properties map[string]string) *endpoint.Endpoint {
+		ep := endpoint.NewEndpoint("joe."+testZone, endpoint.RecordTypeA, "192.0.2.1")
+		for name, value := range properties {
+			ep.WithProviderSpecific(name, value)
+		}
+
+		return ep
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			desired := endpoint.NewEndpoint("joe."+testZone, endpoint.RecordTypeA, "192.0.2.1")
-			if tt.weight != "" {
-				desired.WithProviderSpecific(providerSpecificWeight, tt.weight)
+			client := &fakeClient{zones: zonesNamed(testZone)}
+			p := NewProvider(client, Options{IncludeDomains: []string{testZone}})
+
+			if err := p.ApplyChanges(context.Background(), &plan.Changes{Create: []*endpoint.Endpoint{newEndpoint(tt.created)}}); err != nil {
+				t.Fatalf("create: %v", err)
 			}
 
-			adjusted, err := p.AdjustEndpoints([]*endpoint.Endpoint{desired})
+			adjusted, err := p.AdjustEndpoints([]*endpoint.Endpoint{newEndpoint(tt.desired)})
 			if err != nil {
 				t.Fatalf("AdjustEndpoints: %v", err)
 			}
@@ -538,11 +608,6 @@ func TestAdjustEndpointsMatchesRecordAsCreated(t *testing.T) {
 			}).Calculate().Changes
 			if len(changes.Create) != 0 || len(changes.Delete) != 0 || len(changes.UpdateNew) != tt.wantUpdates {
 				t.Errorf("changes = %+v, want %d updates and nothing else", changes, tt.wantUpdates)
-			}
-			if tt.weight != "" {
-				if got, _ := adjusted[0].GetProviderSpecificProperty(providerSpecificWeight); got != tt.weight {
-					t.Errorf("weight = %q, want the explicit %q", got, tt.weight)
-				}
 			}
 		})
 	}

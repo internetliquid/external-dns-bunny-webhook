@@ -26,8 +26,8 @@ webhook may write to. Create, update and delete all choose a zone the same way:
   `98dollarwebsite.com`.
 - Only zones on the list are considered. With the list unset, every zone in the Bunny account is.
 - Upper case and a trailing dot make no difference.
-- If no zone fits, or a listed zone is not in the Bunny account, the change fails with an error
-  naming it and nothing is written; external-dns tries again on its next pass.
+- If no zone fits, or a listed zone is not in the Bunny account, the whole pass fails with an error
+  naming it and nothing in that pass is written; external-dns tries again on its next pass.
 - A record for the zone's own name (the apex) is stored in Bunny with an empty name and read back
   under the zone's name without churn, but apex routes are not supported: external-dns files the
   apex's ownership record outside the zone (`a-apps.98dollarwebsite.com` for
