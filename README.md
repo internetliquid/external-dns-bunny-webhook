@@ -68,7 +68,7 @@ provider:
   webhook:
     image:
       repository: ghcr.io/internetliquid/external-dns-bunny-webhook
-      tag: v0.100.0
+      tag: v0.100.1
     env:
       - name: BUNNY_API_KEY
         valueFrom:
