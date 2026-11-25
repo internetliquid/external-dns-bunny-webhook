@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.100.1](https://github.com/internetliquid/external-dns-bunny-webhook/compare/v0.100.0...v0.100.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* **image:** distroless debian13 base and Go 1.27.4; clear x/net advisories ([#5](https://github.com/internetliquid/external-dns-bunny-webhook/issues/5)) ([ff9b62e](https://github.com/internetliquid/external-dns-bunny-webhook/commit/ff9b62ea41e6b7bc17e875a041aea3b5ec8941f8))
+
 ## 0.100.0 (2026-10-07)
 
 
